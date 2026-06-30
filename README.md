@@ -158,6 +158,63 @@ ORD-1003:{"paymentId":"PAY-003","orderId":"ORD-1003","total":310000,"status":"RE
 - El topic `inventory` queda vacío por ahora; será utilizado en capítulos posteriores cuando el `inventory-service` consuma eventos de `orders` y publique su respuesta.
 - Con un solo broker (`replication-factor 1`) el entorno es funcional para laboratorio pero no tolerante a fallos, como se analizó en la Actividad 2.
 
+---
+
+## Actividad 4 — Trazabilidad del evento (Cap. 4)
+
+> Documente el recorrido del evento desde la solicitud HTTP hasta el consumidor. Indique topic, clave, partición,
+> consumidor, Consumer Group y evidencia en Kafka UI.
+
+### Componentes involucrados
+
+| Componente | Clase | Responsabilidad |
+|------------|-------|------------------|
+| Endpoint REST | `OrderController` | Recibe la solicitud HTTP y construye el evento de dominio. |
+| Evento de dominio | `OrderCreatedEvent` | Representa el hecho `order-created` (orderId, customerId, total, status, occurredAt). |
+| Productor | `OrderEventProducer` | Publica el evento en el topic `orders` usando `orderId` como clave. |
+| Topic | `orders` | Configurado con 3 particiones y factor de replicación 1 (`KafkaTopicConfig`). |
+| Consumidor | `OrderEventConsumer` | Escucha el topic `orders` dentro del Consumer Group `inventory-service`. |
+
+### Recorrido del evento
+
+1. **Solicitud HTTP**: el cliente envía `POST /orders` con `customerId` y `total` en el body.
+2. **Controller**: `OrderController.createOrder()` recibe el `CreateOrderRequest`, genera un `orderId` único (`"ORD-" + UUID.randomUUID()`) y construye el `OrderCreatedEvent` con estado `CREATED`.
+3. **Producer**: `OrderEventProducer.publishOrderCreated(event)` invoca `kafkaTemplate.send("orders", event.getOrderId(), event)`, publicando el evento en el topic `orders` con `orderId` como clave de partición.
+4. **Broker**: Kafka calcula la partición mediante `hash(orderId) % 3` (el topic tiene 3 particiones) y almacena el evento en el offset correspondiente. Todos los eventos de un mismo `orderId` quedarán siempre en la misma partición.
+5. **Consumer**: `OrderEventConsumer`, registrado con `@KafkaListener(topics = "orders", groupId = "inventory-service")`, recibe el evento y lo imprime en consola: `Evento recibido en inventory-service: <orderId>`.
+
+### Detalle de trazabilidad
+
+| Atributo | Valor |
+|----------|-------|
+| Topic | `orders` |
+| Clave (key) | `orderId` (ej. `ORD-3f2a1c9e-...`) |
+| Partición | Determinada por `hash(orderId) % 3` |
+| Consumer | `OrderEventConsumer.consume()` |
+| Consumer Group | `inventory-service` |
+| Serialización | `JsonSerializer` (producer) / `JsonDeserializer` (consumer) |
+
+### Prueba
+
+```bash
+curl -X POST http://localhost:8081/orders \
+  -H "Content-Type: application/json" \
+  -d '{"customerId":"CUS-01","total":120000}'
+```
+
+![Evento recibido en consola por inventory-service](images/TrazabilidadConsola.png)
+
+### Evidencia en Kafka UI
+
+![Mensaje publicado en el topic orders con clave, partición y offset](images/TrazabilidadKafkaUI.png)
+
+### Observaciones
+
+- El `orderId` como clave garantiza que, si en el futuro se agregan más eventos relacionados al mismo pedido (pagos, inventario), todos lleguen a la misma partición y se procesen en orden.
+- El Consumer Group `inventory-service` es independiente del `group-id` por defecto (`order-service`) definido en `application.yml`; el `groupId` del `@KafkaListener` tiene prioridad y permite que distintos servicios lógicos consuman el mismo topic sin competir por las particiones.
+- Toda la trayectoria (HTTP → Controller → Producer → Broker → Consumer) es la materialización práctica del flujo conceptual descrito en el Capítulo 1: el productor publica y continúa, sin conocer ni esperar al consumidor.
+
+---
 
 ## Actividad 1 — Decisiones de comunicación (Cap. 9.1)
 

@@ -13,11 +13,11 @@ import org.springframework.web.bind.annotation.RestController;
 import edu.eci.arsw.kafka.dto.CreateOrderRequest;
 import edu.eci.arsw.kafka.dto.OrderCreatedEvent;
 import edu.eci.arsw.kafka.producer.OrderEventProducer;
-import lombok.Data;
+import lombok.RequiredArgsConstructor;
 
 @RestController
 @RequestMapping("/orders")
-@Data
+@RequiredArgsConstructor
 public class OrderController {
     private final OrderEventProducer producer;
 

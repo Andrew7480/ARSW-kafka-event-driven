@@ -1,9 +1,13 @@
 package edu.eci.arsw.kafka.producer;
 
-import edu.eci.arsw.kafka.dto.OrderCreatedEvent;
-import lombok.Data;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
 
-@Data
+import edu.eci.arsw.kafka.dto.OrderCreatedEvent;
+import lombok.RequiredArgsConstructor;
+
+@Service
+@RequiredArgsConstructor
 public class OrderEventProducer {
     private final KafkaTemplate<String, OrderCreatedEvent> kafkaTemplate;
 

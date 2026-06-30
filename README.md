@@ -24,6 +24,8 @@ Los procesos que **impactan directamente la experiencia inmediata del usuario** 
 
 ---
 
+
+
 ## Actividad 1 — Decisiones de comunicación (Cap. 9.1)
 
 > Clasifique los siguientes procesos como REST, Kafka o arquitectura híbrida para una tienda en línea.
@@ -47,3 +49,144 @@ En una tienda en línea, la arquitectura óptima combina REST y Kafka según la 
 - **REST** para procesos que requieren respuesta inmediata al usuario (consultas, confirmaciones).
 - **Kafka** para procesos asíncronos que no necesitan respuesta inmediata, que involucran múltiples consumidores o que se benefician del reprocesamiento (notificaciones, analítica, auditoría).
 - **Híbrido** para procesos de negocio core como crear pedidos, validar pagos y actualizar inventario, donde el punto de entrada es síncrono pero las consecuencias se propagan de forma asíncrona mediante eventos.
+
+---
+
+## Actividad 2 — Decisiones de configuración (Cap. 2)
+
+> Analice una configuración con un topic `orders`, una partición, factor de replicación 1, mensajes sin clave
+> y retención de 24 horas. Identifique riesgos y proponga mejoras para un ambiente productivo.
+
+### Configuración analizada
+
+| Parámetro             | Valor actual |
+|-----------------------|--------------|
+| Topic                 | `orders`     |
+| Particiones           | 1            |
+| Factor de replicación | 1            |
+| Clave de mensaje      | Ninguna      |
+| Retención             | 24 horas     |
+
+### Riesgos identificados
+
+| Parámetro             | Riesgo                                                                                                                                                                                   | Atributo afectado            |
+|-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------|
+| 1 partición           | Solo un consumidor del grupo puede procesar mensajes en paralelo. Ante alto volumen de pedidos se convierte en un cuello de botella irrecuperable sin rediseño del topic.               | Escalabilidad                |
+| Replicación 1         | Si el único broker falla, todos los eventos del topic se pierden permanentemente. No existe ninguna réplica de respaldo ni ISR.                                                          | Disponibilidad / Durabilidad |
+| Sin clave             | Los mensajes se distribuyen en round-robin. Si en el futuro se agregan particiones, eventos del mismo pedido pueden quedar en particiones distintas, rompiendo el orden por `orderId`.   | Consistencia                 |
+| Retención 24 horas    | Si un consumidor cae por más de 24 horas (incidente, mantenimiento), los eventos se pierden sin posibilidad de reprocesamiento. Tampoco es viable para analítica histórica ni auditoría. | Confiabilidad / Trazabilidad |
+
+### Propuesta de mejoras para producción
+
+| Parámetro             | Valor actual | Valor propuesto | Justificación |
+|-----------------------|--------------|-----------------|---------------|
+| Particiones           | 1            | 3               | Permite que hasta 3 consumidores del mismo grupo trabajen en paralelo, aumentando el throughput y habilitando escalabilidad horizontal. |
+| Factor de replicación | 1            | 3               | Tolera la caída de hasta 2 brokers sin pérdida de datos. Se recomienda además `min.insync.replicas=2` para que al menos 2 réplicas confirmen cada escritura. |
+| Clave de mensaje      | Ninguna      | `orderId`       | Garantiza que todos los eventos de un mismo pedido lleguen a la misma partición, preservando su orden cronológico. |
+| Retención             | 24 horas     | 7 días          | Permite recuperar consumidores caídos, habilita reprocesamiento ante errores y soporta analítica e auditoría histórica. |
+
+### Conclusión
+
+Esta configuración es aceptable en un entorno local de laboratorio pero inapropiada para producción. Los riesgos principales son la pérdida total de datos ante fallo del broker (replicación 1), la incapacidad de escalar el procesamiento (1 partición) y la pérdida irreversible de eventos ante caídas de consumidores superiores a 24 horas. Las mejoras propuestas abordan directamente los atributos de escalabilidad, disponibilidad, confiabilidad y trazabilidad.
+
+---
+
+## Actividad 3 — Entorno de laboratorio (Cap. 3)
+
+> Cree los topics `orders`, `payments` e `inventory`. Publique al menos cinco eventos JSON
+> y verifique en Kafka UI el topic, partición, offset, clave y contenido.
+
+### Levantar el entorno
+
+```bash
+docker compose up -d
+docker ps
+```
+
+Kafka UI disponible en [http://localhost:8080](http://localhost:8080). Broker expuesto en `localhost:9092`.
+
+![Kafka UI online](images/UIKafka.png)
+
+### Crear los topics
+
+```bash
+docker exec -it arsw-kafka bash
+
+/opt/kafka/bin/kafka-topics.sh --create --topic orders \
+  --bootstrap-server localhost:9092 --partitions 3 --replication-factor 1
+
+/opt/kafka/bin/kafka-topics.sh --create --topic payments \
+  --bootstrap-server localhost:9092 --partitions 3 --replication-factor 1
+
+/opt/kafka/bin/kafka-topics.sh --create --topic inventory \
+  --bootstrap-server localhost:9092 --partitions 3 --replication-factor 1
+
+# Verificar
+/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+```
+
+![Topics creados en terminal](images/TopicsTerminal.png)
+
+### Publicar eventos JSON
+
+**Topic `orders`:**
+
+```bash
+/opt/kafka/bin/kafka-console-producer.sh --topic orders \
+  --bootstrap-server localhost:9092 \
+  --property "parse.key=true" --property "key.separator=:"
+```
+
+```
+ORD-1001:{"orderId":"ORD-1001","customerId":"CUS-01","total":120000,"status":"CREATED"}
+ORD-1002:{"orderId":"ORD-1002","customerId":"CUS-02","total":85000,"status":"CREATED"}
+ORD-1003:{"orderId":"ORD-1003","customerId":"CUS-03","total":310000,"status":"CREATED"}
+```
+
+![Eventos publicados en orders](images/Eventos.png)
+
+**Topic `payments`:**
+
+```bash
+/opt/kafka/bin/kafka-console-producer.sh --topic payments \
+  --bootstrap-server localhost:9092 \
+  --property "parse.key=true" --property "key.separator=:"
+```
+
+```
+ORD-1001:{"paymentId":"PAY-001","orderId":"ORD-1001","total":120000,"status":"APPROVED"}
+ORD-1002:{"paymentId":"PAY-002","orderId":"ORD-1002","total":85000,"status":"APPROVED"}
+ORD-1003:{"paymentId":"PAY-003","orderId":"ORD-1003","total":310000,"status":"REJECTED"}
+```
+
+![Eventos publicados en payments](images/EventosPayment.png)
+
+### Consumir y verificar por consola
+
+```bash
+/opt/kafka/bin/kafka-console-consumer.sh --topic orders \
+  --bootstrap-server localhost:9092 --from-beginning \
+  --property print.key=true \
+  --property print.partition=true \
+  --property print.offset=true
+```
+
+![Verificación por consola](images/VerificacionTerminal.png)
+
+### Verificación en Kafka UI
+
+| Campo       | Evidencia esperada                                                                      |
+|-------------|-----------------------------------------------------------------------------------------|
+| Topic       | Los 3 topics (`orders`, `payments`, `inventory`) aparecen en la lista.                 |
+| Particiones | Cada topic muestra 3 particiones (0, 1, 2).                                             |
+| Offset      | Los offsets avanzan secuencialmente por partición según los mensajes publicados.         |
+| Clave       | Cada mensaje muestra su `orderId` como clave (ej. `ORD-1001`).                         |
+| Contenido   | El payload JSON es legible con los campos del evento.                                   |
+
+![Topics visibles en Kafka UI](images/TopicsUI.png)
+
+### Observaciones
+
+- Los mensajes con la misma clave (`orderId`) siempre se enrutan a la misma partición, garantizando orden por pedido.
+- El topic `inventory` queda vacío por ahora; será utilizado en capítulos posteriores cuando el `inventory-service` consuma eventos de `orders` y publique su respuesta.
+- Con un solo broker (`replication-factor 1`) el entorno es funcional para laboratorio pero no tolerante a fallos, como se analizó en la Actividad 2.

@@ -373,6 +373,88 @@ curl.exe -X POST http://localhost:8081/orders -H "Content-Type: application/json
 
 ---
 
+## Actividad 7 — Estrategia de errores (Cap. 7)
+
+> Diseñe una estrategia para manejar eventos fallidos en inventory-service. Indique cuándo reintentar, cuándo enviar
+> a DLT, qué información revisar y cómo evitar reprocesamientos infinitos.
+
+### Tipos de error identificados en `inventory-service`
+
+| Tipo | Ejemplo concreto en este proyecto | Estrategia |
+|------|-----------------------------------|------------|
+| Transitorio | `InventoryEventProducer.publish()` falla al enviar a `inventory` por una caída momentánea del broker o timeout de red. | Reintentar con backoff fijo (3 intentos, 2 s entre cada uno). |
+| Permanente | Un mensaje en `orders` sin cabecera de tipo o con JSON incompatible con `OrderCreatedEvent` — exactamente el caso de los eventos `ORD-1001`, `ORD-1002`, `ORD-1003` publicados manualmente en la Actividad 3 con `kafka-console-producer`, sin pasar por `JsonSerializer`. | Enviar directo a DLT **sin reintentar**: el mensaje nunca va a deserializar bien, reintentar solo agrega latencia innecesaria. |
+| Negocio | `total` inválido o ausente al evaluar si el pedido se reserva. | No es un error técnico: se publica igual un `InventoryProcessedEvent` con `status = "REJECTED"`. No debe ir a DLT. |
+| Técnico | Excepción no controlada dentro de `consume()` (ej. `NullPointerException` si `customerId` llega nulo). | Reintentar con backoff; si persiste tras los 3 intentos, enviar a DLT. |
+
+### Cuándo reintentar vs. cuándo enviar directo a DLT
+
+- **Reintentar** cuando el error puede resolverse solo con el tiempo (problema transitorio de red, broker temporalmente no disponible, excepción técnica no determinística).
+- **Enviar directo a DLT sin reintentar** cuando el error es determinístico: el mismo mensaje va a fallar siempre de la misma forma (errores de deserialización, contrato de evento incompatible). Reintentar en estos casos no cambia el resultado y solo retrasa que el problema se detecte.
+
+### Implementación
+
+**`application.yml`** — se envuelven los deserializadores con `ErrorHandlingDeserializer` para que los errores de deserialización lleguen al manejador de errores en vez de interrumpir el hilo del consumer:
+
+```yaml
+consumer:
+  group-id: order-service
+  auto-offset-reset: earliest
+  key-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+  value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+  properties:
+    spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+    spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+    spring.json.trusted.packages: "edu.eci.arsw.kafka.dto"
+```
+
+**`KafkaErrorHandlingConfig.java`** (nuevo) — define el `DefaultErrorHandler` compartido por todos los `@KafkaListener` del proyecto:
+
+```java
+@Configuration
+public class KafkaErrorHandlingConfig {
+
+    @Bean
+    public DefaultErrorHandler errorHandler(KafkaTemplate<Object, Object> kafkaTemplate) {
+        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
+                (record, exception) -> new TopicPartition(record.topic() + ".DLT", record.partition()));
+
+        FixedBackOff backOff = new FixedBackOff(2000L, 3L);
+        DefaultErrorHandler errorHandler = new DefaultErrorHandler(recoverer, backOff);
+
+        errorHandler.addNotRetryableExceptions(DeserializationException.class);
+
+        return errorHandler;
+    }
+}
+```
+
+Esta configuración aplica automáticamente a `InventoryServiceConsumer` y a `PaymentServiceConsumer`, ya que Spring Boot conecta el único bean `DefaultErrorHandler` del contexto al `ConcurrentKafkaListenerContainerFactory` por defecto.
+
+### Qué información revisar en un mensaje de `orders.DLT`
+
+Spring agrega automáticamente cabeceras de diagnóstico a cada mensaje publicado en el DLT:
+
+| Cabecera | Información que aporta |
+|----------|-------------------------|
+| `kafka_dlt-exception-message` | Mensaje de la excepción que causó el fallo. |
+| `kafka_dlt-exception-stacktrace` | Stacktrace completo para depuración. |
+| `kafka_dlt-original-topic` | Topic original del mensaje (`orders`). |
+| `kafka_dlt-original-partition` / `kafka_dlt-original-offset` | Ubicación exacta del mensaje que falló, para poder correlacionarlo con el topic original. |
+| Value (payload crudo) | El contenido del mensaje tal como llegó, para saber si el problema fue del productor o del contrato del evento. |
+
+### Cómo evitar reprocesamientos infinitos
+
+- El `FixedBackOff(2000L, 3L)` limita los reintentos a 3; agotados, el `DeadLetterPublishingRecoverer` publica en el DLT **y confirma (commit) el offset original**, por lo que el consumer avanza y no se queda atascado repitiendo el mismo mensaje.
+- Los errores de deserialización se marcan como no reintentables (`addNotRetryableExceptions`), evitando gastar los 3 intentos en un error que nunca se va a resolver solo.
+- Un mensaje en `orders.DLT` **no vuelve automáticamente** a `orders`: cualquier reproceso requiere una acción explícita (revisión manual o un job de reintento aparte), evitando que un evento problemático entre en un ciclo automático de reintentos infinitos entre topics.
+
+### Idempotencia (a futuro)
+
+Actualmente `InventoryServiceConsumer` no verifica si un `orderId` ya fue procesado antes de publicar su `InventoryProcessedEvent`. Si Kafka reentrega un mensaje (ej. tras un rebalanceo o un reinicio antes de confirmar el offset), se publicaría un evento de inventario duplicado. Para un entorno productivo, la mejora natural es que `inventory-service` registre los `orderId` ya procesados (tabla de eventos procesados o restricción única) y descarte los duplicados antes de publicar, en línea con lo descrito en la sección 7.4 del laboratorio.
+
+---
+
 ## Actividad 1 — Decisiones de comunicación (Cap. 9.1)
 
 > Clasifique los siguientes procesos como REST, Kafka o arquitectura híbrida para una tienda en línea.

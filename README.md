@@ -166,7 +166,7 @@ ORD-1003:{"paymentId":"PAY-003","orderId":"ORD-1003","total":310000,"status":"RE
 
 ---
 
-# Actividad 4 — Trazabilidad del evento (Cap. 4)
+## Actividad 4 — Trazabilidad del evento (Cap. 4)
 
 > Documente el recorrido del evento desde la solicitud HTTP hasta el consumidor. Indique topic, clave, partición,
 > consumidor, Consumer Group y evidencia en Kafka UI.
@@ -222,12 +222,12 @@ curl -X POST http://localhost:8081/orders \
 
 ---
 
-### Actividad 5 - Diseño del flujo 
+## Actividad 5 — Diseño del flujo (Cap. 5)
 
 > Proponga los eventos, topics, productores, consumidores, Consumer Groups y claves de particionamiento para el 
 > flujo de compra. Justifique por qué no conviene usar un único topic global llamado events. 
 
-## Eventos propuestos
+### Eventos propuestos
 
 | Evento | Servicio productor | Servicios consumidores |
 |---------|--------------------|-------------------------|
@@ -243,7 +243,7 @@ curl -X POST http://localhost:8081/orders \
 | `notification-failed` | Notification Service | Audit Service |
 
 
-## Topics propuestos
+### Topics propuestos
 
 | Topic | Eventos principales | Clave de particionamiento |
 |--------|---------------------|---------------------------|
@@ -255,7 +255,7 @@ curl -X POST http://localhost:8081/orders \
 | `audit` | `audit-record-created` | `correlationId` |
 
 
-## Productores
+### Productores
 
 | Servicio | Topic donde publica |
 |----------|----------------------|
@@ -267,21 +267,21 @@ curl -X POST http://localhost:8081/orders \
 | Audit Service | `audit` |
 
 
-## Consumidores
+### Consumidores
 
 | Servicio | Topics que consume | Consumer Group |
 |----------|--------------------| ----------------|
-| Payment Service | `orders` | `payment-group` |
-| Inventory Service | `orders` | `inventory-group` |
-| Invoice Service | `payments` | `invoice-group` |
-| Notification Service | `payments`, `inventory`, `invoices` | `notification-group` |
-| Analytics Service | `orders`, `payments`, `inventory`, `invoices`, `notifications` | `analytics-group` |
-| Audit Service | Todos los topics | `audit-group` |
+| Payment Service | `orders` | `payment-service` |
+| Inventory Service | `orders` | `inventory-service` |
+| Invoice Service | `payments` | `invoice-service` |
+| Notification Service | `payments`, `inventory`, `invoices` | `notification-service` |
+| Analytics Service | `orders`, `payments`, `inventory`, `invoices`, `notifications` | `analytics-service` |
+| Audit Service | `orders`, `payments`, `inventory`, `invoices`, `notifications` (todos los topics de negocio, no su propio topic de salida `audit`) | `audit-service` |
 
-Cada microservicio pertenece a un Consumer Group diferente para que todos reciban una copia independiente de los eventos.
+Cada microservicio pertenece a un Consumer Group diferente para que todos reciban una copia independiente de los eventos. Los nombres de grupo coinciden con los usados en la implementación del Cap. 4 (`groupId = "inventory-service"`) y con los que propone el Cap. 6 del laboratorio (`payment-service`, `inventory-service`), manteniendo consistencia entre el diseño documentado y el código.
 
 
-## Claves de particionamiento
+### Claves de particionamiento
 **`orderId`** para los topics:
   - `orders`
   - `payments`
@@ -293,7 +293,7 @@ Cada microservicio pertenece a un Consumer Group diferente para que todos reciba
 **`correlationId`** para el topic `audit`.
 
 
-## ¿Por qué no conviene usar un único topic llamado `events`?
+### ¿Por qué no conviene usar un único topic llamado `events`?
 
 No es recomendable utilizar un único topic global porque:
 
@@ -306,6 +306,70 @@ No es recomendable utilizar un único topic global porque:
 
 Por estas razones, es una mejor práctica separar los eventos en topics específicos (`orders`, `payments`, `inventory`, `invoices`, `notifications` y `audit`), lo que mejora la escalabilidad, el rendimiento y la mantenibilidad del sistema.
 
+---
+
+## Actividad 6 — Evidencia y análisis (Cap. 6)
+
+> Cree pedidos con valores diferentes y reconstruya el flujo de eventos en Kafka UI. Identifique eventos generados,
+> topics, claves, Consumer Groups, offsets y lag.
+
+Vamos a extender la aplicación para que el evento `order-created` (topic `orders`) desencadene, sin acoplamiento directo, dos nuevos eventos: uno de pago (`payments`) y uno de inventario (`inventory`). Cada uno es publicado por un consumer distinto que escucha `orders` desde su propio Consumer Group.
+
+### Cambios respecto al Cap. 4
+
+| Cambio | Detalle |
+|--------|---------|
+| Renombrado | `OrderEventConsumer` → `InventoryServiceConsumer`. Mismo `groupId` (`inventory-service`) y mismo `println` del Cap. 4, ahora extendido para publicar también un `InventoryProcessedEvent`. |
+| Nuevo consumer | `PaymentServiceConsumer`, con `groupId = "payment-service"`, escucha `orders` de forma independiente y publica `PaymentProcessedEvent`. |
+| Nuevos productores | `PaymentEventProducer` (publica en `payments`) e `InventoryEventProducer` (publica en `inventory`), siguiendo el mismo patrón que `OrderEventProducer`. |
+| Nuevos DTOs | `PaymentProcessedEvent` (`paymentId`, `orderId`, `customerId`, `total`, `status`, `occurredAt`) e `InventoryProcessedEvent` (`inventoryId`, `orderId`, `customerId`, `status`, `occurredAt`). |
+
+`payment-service` e `inventory-service` son grupos distintos, así que **ambos reciben una copia completa** de cada evento `order-created` — no compiten por las particiones entre sí, solo compiten consigo mismos si se escalan varias instancias del mismo servicio.
+
+### Reglas de negocio (simuladas)
+
+| Servicio | Condición | Resultado |
+|----------|-----------|-----------|
+| Payment Service | `total <= 250000` | `APPROVED`, si no `REJECTED` |
+| Inventory Service | `total <= 300000` | `RESERVED`, si no `REJECTED` |
+
+### Escenarios de prueba sugeridos
+
+| Total | Pago esperado | Inventario esperado |
+|-------|----------------|----------------------|
+| `200000` | APPROVED | RESERVED |
+| `280000` | REJECTED | RESERVED |
+| `350000` | REJECTED | REJECTED |
+
+### Comandos de prueba (PowerShell)
+
+```powershell
+curl.exe -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"CUS-01\",\"total\":200000}"
+curl.exe -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"CUS-02\",\"total\":280000}"
+curl.exe -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"CUS-03\",\"total\":350000}"
+```
+
+### Evidencia en consola
+
+![Consola mostrando los eventos recibidos por payment-service e inventory-service](images/Cap6Consola.png)
+
+### Evidencia en Kafka UI — topic `payments`
+
+![Mensajes publicados en el topic payments con clave, partición y offset](images/Cap6PaymentsUI.png)
+
+### Evidencia en Kafka UI — topic `inventory`
+
+![Mensajes publicados en el topic inventory con clave, partición y offset](images/Cap6InventoryUI.png)
+
+### Evidencia en Kafka UI — Consumer Groups
+
+![Consumer Groups payment-service e inventory-service con sus offsets y lag](images/Cap6ConsumersLag.png)
+
+### Observaciones
+
+- Cada `orderId` es la clave tanto en `orders` como en `payments` e `inventory`, por lo que los tres eventos de un mismo pedido quedan trazables entre topics aunque residan en particiones numeradas igual solo por coincidencia de hash, no por diseño compartido.
+- `payment-service` e `inventory-service` procesan el **mismo** evento `order-created` de forma totalmente independiente y en paralelo: ninguno depende del resultado del otro, lo que evidencia el bajo acoplamiento de la arquitectura orientada por eventos.
+- El lag de cada Consumer Group en Kafka UI debería mantenerse en 0 poco después de publicar cada pedido, ya que ambos consumers procesan casi instantáneamente. Un lag creciente indicaría que el consumer no está manteniendo el ritmo del productor.
 
 ---
 

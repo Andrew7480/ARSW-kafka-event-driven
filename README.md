@@ -455,6 +455,63 @@ Actualmente `InventoryServiceConsumer` no verifica si un `orderId` ya fue proces
 
 ---
 
+## Actividad 8 — Diagnóstico de buenas prácticas (Cap. 8)
+
+> Revise una arquitectura que usa un topic `events`, mensajes sin clave, factor de replicación 1, sin DLT y sin
+> monitoreo de lag. Identifique problemas, atributos afectados y mejoras prioritarias.
+
+### Configuración analizada
+
+| Parámetro | Valor actual |
+|-----------|--------------|
+| Topic | `events` (único, global para todo el dominio) |
+| Clave de mensaje | Ninguna |
+| Factor de replicación | 1 |
+| Dead Letter Topic | No configurado |
+| Monitoreo de lag | No configurado |
+
+### Problemas identificados
+
+| Parámetro | Problema | Atributo afectado |
+|-----------|----------|--------------------|
+| Topic único `events` | Mezcla eventos de dominios distintos (pedidos, pagos, inventario, notificaciones, auditoría) en un mismo topic. Cada consumidor debe leer y descartar mensajes que no le interesan, y no es posible aplicar retención, particiones o permisos diferenciados por tipo de evento (mismo problema que se justificó evitar en la Actividad 5). | Mantenibilidad / Escalabilidad / Rendimiento |
+| Sin clave de mensaje | Los eventos se distribuyen round-robin entre particiones. Eventos relacionados de un mismo `orderId` pueden terminar en particiones distintas, rompiendo su orden relativo. | Consistencia |
+| Factor de replicación 1 | Si el único broker falla, se pierden permanentemente todos los eventos del topic; no hay ISR de respaldo. | Disponibilidad / Durabilidad |
+| Sin Dead Letter Topic | Un evento que falla de forma permanente (ej. error de deserialización) no tiene a dónde ir: según cómo esté configurado el consumer, se pierde silenciosamente o bloquea el procesamiento del resto de mensajes de esa partición. | Confiabilidad |
+| Sin monitoreo de lag | No hay forma de detectar que un consumer se está quedando atrás o dejó de procesar hasta que el impacto de negocio ya es visible (ej. pagos sin confirmar). | Observabilidad |
+
+### Riesgos para producción
+
+- **Pérdida total de datos** ante la caída del único broker (replicación 1), sin posibilidad de recuperación.
+- **Eventos desordenados** entre servicios que dependen de la secuencia correcta (ej. `order-created` antes que `payment-approved` para el mismo pedido).
+- **Fallos silenciosos**: sin DLT, un evento problemático puede perderse sin que nadie se entere, o bloquear indefinidamente el procesamiento de una partición completa.
+- **Incidentes detectados tarde**: sin monitoreo de lag, un consumer caído o lento se descubre solo cuando el negocio ya sufrió el impacto (pedidos sin procesar, notificaciones no enviadas).
+- **Acoplamiento accidental** entre dominios: un cambio en el formato de un evento de un dominio (ej. `payment-approved`) puede romper consumidores de otros dominios que comparten el mismo topic `events` sin necesitarlo.
+
+### Cambios prioritarios (de mayor a menor impacto)
+
+1. **Separar `events` en topics por dominio** (`orders`, `payments`, `inventory`, etc.), como se definió en la Actividad 5 — es el cambio de mayor impacto arquitectónico, ya que habilita el resto de mejoras (retención, particiones y permisos por topic).
+2. **Aumentar el factor de replicación** a 3 (con `min.insync.replicas=2`) — evita pérdida de datos ante fallo de un broker.
+3. **Definir clave de particionamiento** coherente por entidad (`orderId`, `correlationId`) — garantiza orden por pedido.
+4. **Configurar DLT y reintentos con backoff** (como se implementó en la Actividad 7) — evita pérdidas silenciosas y bloqueos indefinidos.
+5. **Agregar monitoreo de lag** (Kafka UI, métricas expuestas a un sistema de alertas) — permite detectar consumidores caídos o lentos antes de que impacten al negocio.
+
+### Propuesta de mejora resumida
+
+| Parámetro | Valor actual | Valor propuesto | Justificación |
+|-----------|---------------|------------------|----------------|
+| Topics | `events` (único) | `orders`, `payments`, `inventory`, `invoices`, `notifications`, `audit` | Aísla dominios, permite configuración independiente por topic. |
+| Clave de mensaje | Ninguna | `orderId` / `correlationId` según el topic | Preserva el orden de eventos relacionados. |
+| Factor de replicación | 1 | 3 | Tolera la caída de hasta 2 brokers sin pérdida de datos. |
+| Manejo de errores | Sin DLT | `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` | Evita pérdidas silenciosas y bloqueos indefinidos del consumer. |
+| Observabilidad | Sin monitoreo de lag | Dashboard de Kafka UI + alertas sobre `Consumer Lag` | Detecta consumidores caídos o lentos de forma temprana. |
+
+### Conclusión
+
+Esta configuración es funcional solo para un prototipo de un único desarrollador en un entorno controlado. Para producción, el problema de mayor impacto es el topic único `events`, ya que condiciona negativamente casi todos los demás atributos de calidad (mantenibilidad, escalabilidad, consistencia); por eso es el primer cambio a priorizar. Los demás ajustes (replicación, clave, DLT y observabilidad) son los mismos que ya se justificaron y, en el caso de replicación y DLT, ya se implementaron en las Actividades 2 y 7 de este mismo proyecto.
+
+---
+
 ## Actividad 1 — Decisiones de comunicación (Cap. 9.1)
 
 > Clasifique los siguientes procesos como REST, Kafka o arquitectura híbrida para una tienda en línea.

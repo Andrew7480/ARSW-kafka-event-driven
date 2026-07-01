@@ -512,7 +512,7 @@ Esta configuración es funcional solo para un prototipo de un único desarrollad
 
 ---
 
-## Actividad 1 — Decisiones de comunicación (Cap. 9.1)
+## Actividad 9.1 — Decisiones de comunicación (Cap. 9)
 
 > Clasifique los siguientes procesos como REST, Kafka o arquitectura híbrida para una tienda en línea.
 > Justificación basada en: respuesta inmediata, asincronía, múltiples consumidores y reprocesamiento.
@@ -535,3 +535,83 @@ En una tienda en línea, la arquitectura óptima combina REST y Kafka según la 
 - **REST** para procesos que requieren respuesta inmediata al usuario (consultas, confirmaciones).
 - **Kafka** para procesos asíncronos que no necesitan respuesta inmediata, que involucran múltiples consumidores o que se benefician del reprocesamiento (notificaciones, analítica, auditoría).
 - **Híbrido** para procesos de negocio core como crear pedidos, validar pagos y actualizar inventario, donde el punto de entrada es síncrono pero las consecuencias se propagan de forma asíncrona mediante eventos.
+
+---
+
+## Actividad 9.2 — Diseño del flujo de eventos (Cap. 9)
+
+> Diseñe el flujo de eventos para el proceso de compra. Incluya eventos principales, productor, consumidores, topic,
+> clave de particionamiento y Consumer Group. Responda por qué no conviene un único topic `events`, por qué los
+> consumidores deben tener grupos distintos y por qué `orderId` puede ser una buena clave.
+
+El diseño completo (tabla de eventos, topics, productores, consumidores y claves) ya se desarrolló en la **Actividad 5** y se implementó de forma parcial en el **Cap. 6** (`orders` → `payment-service` / `inventory-service`). Esta actividad se enfoca en justificar las tres decisiones de diseño puntuales que pide el enunciado.
+
+### ¿Por qué no conviene un único topic `events`?
+
+Mismo argumento que en la Actividad 5: mezclar todos los dominios en un topic global obliga a cada consumidor a filtrar eventos que no le interesan, impide configurar retención/particiones/permisos por tipo de evento, y acopla accidentalmente servicios que no deberían depender entre sí (un cambio de esquema en un evento de pagos podría romper un consumidor de inventario que comparte el mismo topic sin necesitarlo).
+
+### ¿Por qué los consumidores deben tener Consumer Groups distintos?
+
+Porque dentro de un mismo Consumer Group, Kafka reparte las particiones de un topic entre sus miembros — **no** duplica el mensaje a cada uno. Si `payment-service` e `inventory-service` compartieran el mismo `groupId`, cada evento `order-created` lo procesaría **solo uno de los dos**, nunca ambos, y cuál de ellos lo procese dependería de a qué partición quedó asignado cada consumer.
+
+Esto no es teórico: lo comprobamos directamente en este proyecto durante el Cap. 6. Al extender el consumer de inventario, en un punto intermedio quedaron dos clases (`OrderEventConsumer` y una nueva) escuchando `orders` con el mismo `groupId = "inventory-service"`; de haberse desplegado así, las 3 particiones se habrían repartido entre ambas instancias y ningún pedido habría sido procesado por las dos lógicas a la vez. La solución fue la misma que exige esta actividad: cada servicio lógico necesita su **propio** Consumer Group (`payment-service`, `inventory-service`) para que **todos** reciban una copia completa de cada evento `order-created`, de forma independiente y sin competir por particiones.
+
+### ¿Por qué `orderId` puede ser una buena clave?
+
+Porque es el identificador de la entidad cuyo orden importa: todos los eventos relacionados con un mismo pedido (`order-created`, `payment-approved`/`rejected`, `inventory-reserved`/`rejected`) deben procesarse en el orden en que ocurrieron para ese pedido específico. Kafka solo garantiza orden **dentro de una partición**, y el particionamiento por defecto usa `hash(key) % numPartitions`; al usar `orderId` como clave, todos los eventos de un mismo pedido —incluso en topics distintos como `orders`, `payments` e `inventory`— son deterministas en qué partición caen dentro de su topic, evitando que una carrera entre particiones desordene el procesamiento de un mismo pedido.
+
+---
+
+## Actividad 9.3 — Diagnóstico arquitectónico (Cap. 9)
+
+> Configuración propuesta: topic principal `events`, 1 partición, factor de replicación 1, retención 12 horas,
+> mensajes sin clave, sin `eventId`, sin `correlationId`, todos los consumidores en el mismo Consumer Group,
+> sin Dead Letter Topics y sin monitoreo de lag. Realice un diagnóstico técnico breve.
+
+### Problemas identificados
+
+| Parámetro | Problema | Atributo afectado |
+|-----------|----------|--------------------|
+| Topic único `events` | Mezcla todos los dominios de negocio; ya justificado en la Actividad 5/9.2. | Mantenibilidad / Escalabilidad |
+| 1 partición | Un único Consumer Group solo puede paralelizar hasta 1 consumer activo por partición; con 1 partición no hay paralelismo posible, sin importar cuántas instancias se desplieguen. | Escalabilidad |
+| Factor de replicación 1 | Pérdida total de datos si el único broker falla. | Disponibilidad / Durabilidad |
+| Retención 12 horas | Ventana de recuperación muy corta; un incidente que dure más de medio día hace irrecuperables los eventos no procesados. | Confiabilidad / Trazabilidad |
+| Sin clave | Sin orden garantizado entre eventos de una misma entidad (ver 9.2). | Consistencia |
+| Sin `eventId` | Imposible detectar si un evento ya fue procesado; no hay forma de implementar idempotencia ni de deduplicar tras un reintento o una reentrega de Kafka. | Confiabilidad |
+| Sin `correlationId` | Imposible trazar todos los eventos derivados de una misma operación de negocio a través de distintos topics/servicios (ej. para auditoría o debugging de un incidente). | Observabilidad / Trazabilidad |
+| **Todos los consumidores en el mismo Consumer Group** | El más grave: como se explicó en la 9.2, un mismo Consumer Group reparte particiones entre sus miembros, no duplica eventos. Si todos los servicios (pagos, inventario, notificaciones, analítica, auditoría) comparten grupo, **cada evento lo procesa solo un servicio al azar**, no todos los que lo necesitan. El sistema dejaría de funcionar silenciosamente para la mayoría de los servicios. | Correctitud funcional / Confiabilidad |
+| Sin DLT | Eventos con error permanente se pierden o bloquean el consumer, sin diagnóstico posible (ver Actividad 7). | Confiabilidad |
+| Sin monitoreo de lag | Consumidores caídos o lentos se detectan solo cuando el negocio ya sufrió el impacto. | Observabilidad |
+
+### Riesgos para producción
+
+- **El sistema parecería funcionar en pruebas con un solo consumer activo, pero fallaría en producción** apenas se desplegara más de un servicio lógico, porque el Consumer Group compartido haría que solo uno de ellos reciba cada evento — un bug muy difícil de detectar sin monitoreo de lag.
+- Sin `eventId`, cualquier mecanismo de reintento (incluido el DLT recomendado en la Actividad 7) puede generar **duplicados** si el evento sí llegó a procesarse antes del reintento.
+- Sin `correlationId`, un incidente de producción (ej. "el pedido X quedó en un estado inconsistente") es muy difícil de depurar, porque no hay forma de correlacionar los eventos de `events` que pertenecen a esa misma operación de negocio.
+- Ventana de recuperación de solo 12 horas: cualquier mantenimiento de fin de semana o incidente prolongado deja eventos irrecuperables.
+
+### Cambios prioritarios
+
+1. **Separar el Consumer Group compartido** en uno por servicio — es el cambio más urgente, ya que sin esto el sistema no funciona correctamente para más de un consumidor, sin importar qué tan bien estén configurados los demás parámetros.
+2. **Separar `events` en topics por dominio** y aumentar particiones según el paralelismo requerido.
+3. **Agregar `eventId` y `correlationId`** a los metadatos del evento (ver formato recomendado en el Cap. 8 del laboratorio) para habilitar idempotencia y trazabilidad.
+4. **Aumentar factor de replicación** a 3 y retención a varios días, según necesidades de auditoría/reprocesamiento.
+5. **Implementar DLT y monitoreo de lag**, como en las Actividades 7 y 8.
+
+### Propuesta de mejora
+
+| Parámetro | Valor actual | Valor propuesto |
+|-----------|---------------|------------------|
+| Topics | `events` (único) | Uno por dominio (`orders`, `payments`, `inventory`, ...) |
+| Particiones | 1 | Según volumen y paralelismo esperado (ej. 3) |
+| Factor de replicación | 1 | 3, con `min.insync.replicas=2` |
+| Retención | 12 horas | Días, según necesidades de auditoría y reprocesamiento |
+| Clave de mensaje | Ninguna | `orderId` / `correlationId` según el topic |
+| Metadatos del evento | Sin `eventId` ni `correlationId` | Incluir ambos en cada evento |
+| Consumer Groups | Uno compartido para todos los servicios | Uno por servicio lógico (`payment-service`, `inventory-service`, etc.) |
+| Manejo de errores | Sin DLT | `DefaultErrorHandler` + DLT por topic |
+| Observabilidad | Sin monitoreo de lag | Dashboard de lag + alertas |
+
+### Conclusión
+
+El problema de mayor severidad no es de rendimiento ni de configuración fina, sino de **corrección funcional**: compartir un único Consumer Group entre todos los consumidores rompe la premisa básica de una arquitectura orientada por eventos (que cada servicio interesado reciba su propia copia del evento). Ese cambio debe hacerse antes que cualquier otro, porque ninguna mejora de retención, replicación u observabilidad soluciona un sistema que, por diseño, solo entrega cada evento a un consumidor arbitrario en lugar de a todos los que lo necesitan.

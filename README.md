@@ -166,7 +166,7 @@ ORD-1003:{"paymentId":"PAY-003","orderId":"ORD-1003","total":310000,"status":"RE
 
 ---
 
-## Actividad 4 — Trazabilidad del evento (Cap. 4)
+# Actividad 4 — Trazabilidad del evento (Cap. 4)
 
 > Documente el recorrido del evento desde la solicitud HTTP hasta el consumidor. Indique topic, clave, partición,
 > consumidor, Consumer Group y evidencia en Kafka UI.
@@ -219,6 +219,93 @@ curl -X POST http://localhost:8081/orders \
 - El `orderId` como clave garantiza que, si en el futuro se agregan más eventos relacionados al mismo pedido (pagos, inventario), todos lleguen a la misma partición y se procesen en orden.
 - El Consumer Group `inventory-service` es independiente del `group-id` por defecto (`order-service`) definido en `application.yml`; el `groupId` del `@KafkaListener` tiene prioridad y permite que distintos servicios lógicos consuman el mismo topic sin competir por las particiones.
 - Toda la trayectoria (HTTP → Controller → Producer → Broker → Consumer) es la materialización práctica del flujo conceptual descrito en el Capítulo 1: el productor publica y continúa, sin conocer ni esperar al consumidor.
+
+---
+
+### Actividad 5 - Diseño del flujo 
+
+> Proponga los eventos, topics, productores, consumidores, Consumer Groups y claves de particionamiento para el 
+> flujo de compra. Justifique por qué no conviene usar un único topic global llamado events. 
+
+## Eventos propuestos
+
+| Evento | Servicio productor | Servicios consumidores |
+|---------|--------------------|-------------------------|
+| `order-created` | Order Service | Payment Service, Inventory Service, Analytics Service, Audit Service |
+| `order-cancelled` | Order Service | Notification Service, Analytics Service, Audit Service |
+| `payment-approved` | Payment Service | Invoice Service, Notification Service, Analytics Service, Audit Service |
+| `payment-rejected` | Payment Service | Notification Service, Analytics Service, Audit Service |
+| `inventory-reserved` | Inventory Service | Notification Service, Analytics Service, Audit Service |
+| `inventory-rejected` | Inventory Service | Notification Service, Analytics Service, Audit Service |
+| `invoice-generated` | Invoice Service | Notification Service, Analytics Service, Audit Service |
+| `invoice-failed` | Invoice Service | Notification Service, Analytics Service, Audit Service |
+| `notification-sent` | Notification Service | Analytics Service, Audit Service |
+| `notification-failed` | Notification Service | Audit Service |
+
+
+## Topics propuestos
+
+| Topic | Eventos principales | Clave de particionamiento |
+|--------|---------------------|---------------------------|
+| `orders` | `order-created`, `order-cancelled` | `orderId` |
+| `payments` | `payment-approved`, `payment-rejected` | `orderId` |
+| `inventory` | `inventory-reserved`, `inventory-rejected` | `orderId` |
+| `invoices` | `invoice-generated`, `invoice-failed` | `orderId` |
+| `notifications` | `notification-sent`, `notification-failed` | `orderId` |
+| `audit` | `audit-record-created` | `correlationId` |
+
+
+## Productores
+
+| Servicio | Topic donde publica |
+|----------|----------------------|
+| Order Service | `orders` |
+| Payment Service | `payments` |
+| Inventory Service | `inventory` |
+| Invoice Service | `invoices` |
+| Notification Service | `notifications` |
+| Audit Service | `audit` |
+
+
+## Consumidores
+
+| Servicio | Topics que consume | Consumer Group |
+|----------|--------------------| ----------------|
+| Payment Service | `orders` | `payment-group` |
+| Inventory Service | `orders` | `inventory-group` |
+| Invoice Service | `payments` | `invoice-group` |
+| Notification Service | `payments`, `inventory`, `invoices` | `notification-group` |
+| Analytics Service | `orders`, `payments`, `inventory`, `invoices`, `notifications` | `analytics-group` |
+| Audit Service | Todos los topics | `audit-group` |
+
+Cada microservicio pertenece a un Consumer Group diferente para que todos reciban una copia independiente de los eventos.
+
+
+## Claves de particionamiento
+**`orderId`** para los topics:
+  - `orders`
+  - `payments`
+  - `inventory`
+  - `invoices`
+  - `notifications`
+
+
+**`correlationId`** para el topic `audit`.
+
+
+## ¿Por qué no conviene usar un único topic llamado `events`?
+
+No es recomendable utilizar un único topic global porque:
+
+- Mezcla eventos de distintos dominios, dificultando su organización.
+- Los consumidores tendrían que leer y filtrar muchos eventos que no necesitan.
+- Reduce el rendimiento al procesar información innecesaria.
+- Complica el mantenimiento y la evolución del sistema.
+- Limita la posibilidad de configurar particiones, retención y permisos específicos para cada tipo de evento.
+- Incrementa el acoplamiento entre los microservicios.
+
+Por estas razones, es una mejor práctica separar los eventos en topics específicos (`orders`, `payments`, `inventory`, `invoices`, `notifications` y `audit`), lo que mejora la escalabilidad, el rendimiento y la mantenibilidad del sistema.
+
 
 ---
 

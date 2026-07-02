@@ -615,3 +615,153 @@ Porque es el identificador de la entidad cuyo orden importa: todos los eventos r
 ### Conclusión
 
 El problema de mayor severidad no es de rendimiento ni de configuración fina, sino de **corrección funcional**: compartir un único Consumer Group entre todos los consumidores rompe la premisa básica de una arquitectura orientada por eventos (que cada servicio interesado reciba su propia copia del evento). Ese cambio debe hacerse antes que cualquier otro, porque ninguna mejora de retención, replicación u observabilidad soluciona un sistema que, por diseño, solo entrega cada evento a un consumidor arbitrario en lugar de a todos los que lo necesitan.
+
+---
+
+## Reto Final — Arquitectura integral del sistema de pedidos (Cap. 10)
+
+> Diseñe una arquitectura basada en eventos para una plataforma de comercio electrónico con pedidos, pagos,
+> inventario, facturas, notificaciones, analítica y auditoría. Entregue un documento técnico breve con la
+> descripción de la solución, arquitectura propuesta, tabla de servicios, tabla de eventos y topics, claves de
+> particionamiento, Consumer Groups, estrategia de errores, riesgos y justificación de decisiones arquitectónicas.
+
+Este entregable consolida, en un único documento autocontenido, las decisiones tomadas a lo largo del laboratorio (Actividades 2, 5, 6, 7, 8 y 9) y las extiende hasta cubrir los siete servicios que exige el reto final. No repite la implementación completa de cada servicio: `order-service`, `payment-service` e `inventory-service` están **implementados** en este proyecto (Cap. 4 y Cap. 6); `invoice-service`, `notification-service`, `analytics-service` y `audit-service` quedan **diseñados** con el mismo nivel de detalle (topic, claves, Consumer Group), siguiendo el patrón ya validado en código, sin necesidad de duplicar clases Java para que el entregable sea consistente.
+
+### 1. Descripción de la solución
+
+La plataforma se organiza como un conjunto de microservicios débilmente acoplados que se comunican mediante eventos de dominio publicados en Apache Kafka. El punto de entrada (`order-service`) expone un endpoint REST síncrono para que el cliente reciba confirmación inmediata de su pedido; a partir de ahí, cada consecuencia del pedido (pago, inventario, factura, notificación, analítica, auditoría) se propaga de forma asíncrona mediante eventos, sin que `order-service` conozca ni dependa de los servicios que reaccionan a `order-created`. Esto evita cadenas de llamadas síncronas (Cap. 1, sección 1.3) y permite que cada servicio evolucione, falle o escale de forma independiente.
+
+### 2. Arquitectura propuesta
+
+```
+Cliente
+  │  POST /orders (síncrono)
+  ▼
+Order Service ──publica──▶ orders (key: orderId)
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                       ▼
+ Payment Service       Inventory Service        Analytics Service
+ (grupo: payment-      (grupo: inventory-       (grupo: analytics-
+  service)               service)                 service)
+        │                     │
+        ▼                     ▼
+   payments                inventory
+ (key: orderId)          (key: orderId)
+        │                     │
+        ├───────┬─────────────┤
+        ▼       ▼             ▼
+ Invoice Svc  Notification   Analytics Service
+ (grupo:      Service        (consume orders,
+  invoice-     (grupo:         payments,
+  service)     notification-   inventory,
+        │      service)        invoices,
+        ▼                      notifications)
+    invoices ──────┐
+ (key: orderId)     ▼
+              Notification Service
+
+Todos los topics de negocio (orders, payments, inventory,
+invoices, notifications) ──▶ Audit Service (grupo: audit-service)
+                                    │
+                                    ▼
+                              audit (key: correlationId)
+```
+
+Cada flecha hacia un topic representa una publicación con `orderId` como clave (excepto `audit`, que usa `correlationId`), y cada servicio consumidor pertenece a su propio Consumer Group, de modo que **todos** reciben copia completa del evento en lugar de repartirse las particiones entre sí (justificado en detalle en la Actividad 9.2).
+
+### 3. Tabla de servicios (requisito mínimo: 7 servicios)
+
+| Servicio | Responsabilidad | Estado en este repositorio |
+|----------|------------------|------------------------------|
+| `order-service` | Recibe `POST /orders`, genera el `orderId` y publica `order-created` en `orders`. | **Implementado** (`OrderController`, `OrderEventProducer`). |
+| `payment-service` | Consume `orders` y publica `payment-approved` / `payment-rejected` en `payments`. | **Implementado** (`PaymentServiceConsumer`, `PaymentEventProducer`). |
+| `inventory-service` | Consume `orders` y publica `inventory-reserved` / `inventory-rejected` en `inventory`. | **Implementado** (`InventoryServiceConsumer`, `InventoryEventProducer`). |
+| `invoice-service` | Consume `payments`; si `payment-approved`, publica `invoice-generated` en `invoices` (si falla la generación, `invoice-failed`). | Diseñado (mismo patrón que `payment-service`: `@KafkaListener(topics="payments", groupId="invoice-service")` + productor a `invoices`). |
+| `notification-service` | Consume `payments`, `inventory` e `invoices`; publica `notification-sent` / `notification-failed` en `notifications`. | Diseñado (un solo consumer con tres `@KafkaListener`, o uno por topic, todos bajo `groupId="notification-service"`). |
+| `analytics-service` | Consume todos los topics de negocio (`orders`, `payments`, `inventory`, `invoices`, `notifications`) para construir indicadores agregados. No publica eventos. | Diseñado (`groupId="analytics-service"`, solo lectura). |
+| `audit-service` | Consume todos los topics de negocio y publica un registro de trazabilidad en `audit`, indexado por `correlationId`. | Diseñado (`groupId="audit-service"`, solo lectura de negocio + escritura en `audit`). |
+
+### 4. Tabla de eventos y topics (requisito mínimo: 8 eventos)
+
+| Evento | Nombrado como hecho | Topic | Productor | Clave |
+|--------|----------------------|-------|-----------|-------|
+| `order-created` | ✔ | `orders` | `order-service` | `orderId` |
+| `order-cancelled` | ✔ | `orders` | `order-service` | `orderId` |
+| `payment-approved` | ✔ | `payments` | `payment-service` | `orderId` |
+| `payment-rejected` | ✔ | `payments` | `payment-service` | `orderId` |
+| `inventory-reserved` | ✔ | `inventory` | `inventory-service` | `orderId` |
+| `inventory-rejected` | ✔ | `inventory` | `inventory-service` | `orderId` |
+| `invoice-generated` | ✔ | `invoices` | `invoice-service` | `orderId` |
+| `invoice-failed` | ✔ | `invoices` | `invoice-service` | `orderId` |
+| `notification-sent` | ✔ | `notifications` | `notification-service` | `orderId` |
+| `notification-failed` | ✔ | `notifications` | `notification-service` | `orderId` |
+| `audit-record-created` | ✔ | `audit` | `audit-service` | `correlationId` |
+
+Todos los eventos se nombran en pasado (`order-created`, no `create-order`), cumpliendo la convención "eventos como hechos" del Cap. 8.2. Cada topic corresponde a un dominio de negocio distinto — no existe un topic `events` global (restricción explícita del Cap. 10.3, ya argumentada en las Actividades 5 y 8).
+
+### 5. Consumer Groups
+
+| Consumer Group | Servicio | Topics que consume |
+|-----------------|----------|----------------------|
+| `payment-service` | Payment Service | `orders` |
+| `inventory-service` | Inventory Service | `orders` |
+| `invoice-service` | Invoice Service | `payments` |
+| `notification-service` | Notification Service | `payments`, `inventory`, `invoices` |
+| `analytics-service` | Analytics Service | `orders`, `payments`, `inventory`, `invoices`, `notifications` |
+| `audit-service` | Audit Service | `orders`, `payments`, `inventory`, `invoices`, `notifications` |
+
+Cada servicio lógico tiene su **propio** Consumer Group: dentro de un grupo, Kafka reparte particiones entre sus miembros (útil para escalar instancias del mismo servicio), pero entre grupos distintos cada uno recibe una copia independiente y completa del evento. Compartir un `groupId` entre servicios distintos —el error diagnosticado en la Actividad 9.3— haría que cada evento lo procese solo uno de ellos.
+
+### 6. Claves de particionamiento y su justificación
+
+- **`orderId`** para `orders`, `payments`, `inventory`, `invoices` y `notifications`: es el identificador de la entidad cuyo orden de eventos importa (`order-created` → `payment-approved` → `invoice-generated`, etc.). Kafka solo garantiza orden **dentro de una partición**; al usar siempre `orderId`, todos los eventos de un mismo pedido caen de forma determinista en la misma partición de su topic (`hash(orderId) % numPartitions`), evitando que carreras entre particiones desordenen el procesamiento de un pedido.
+- **`correlationId`** para `audit`: el topic de auditoría agrega eventos que provienen de *distintos* `orderId` (y potencialmente de operaciones sin pedido asociado), por lo que la entidad relevante para trazar una operación de negocio completa es el `correlationId` propagado entre servicios (Cap. 8.3), no el `orderId`.
+
+### 7. Diferenciación de procesos síncronos y asíncronos
+
+| Proceso | Tipo | Justificación |
+|---------|------|----------------|
+| `POST /orders` (creación de pedido) | Síncrono | El cliente necesita una confirmación inmediata (`orderId`, estado `CREATED`) para continuar su flujo. |
+| Validación de pago con el gateway | Híbrido | La llamada al proveedor de pago puede requerir respuesta inmediata; el resultado se difunde luego por Kafka (`payment-approved`/`rejected`) para que lo consuman `invoice-service`, `notification-service` y `audit-service`. |
+| Reserva de inventario, facturación, notificación, analítica, auditoría | Asíncrono | No bloquean la respuesta al cliente, se benefician de múltiples consumidores independientes y de reprocesamiento ante fallos (ver Actividad 9.1 para el detalle completo). |
+
+### 8. Estrategia de errores y observabilidad
+
+Se reutiliza sin cambios la estrategia implementada en la Actividad 7 (`KafkaErrorHandlingConfig`): reintentos con `FixedBackOff(2000L, 3L)`, `DeadLetterPublishingRecoverer` hacia `<topic>.DLT` y errores de deserialización marcados como no reintentables. Al ser un único `DefaultErrorHandler` compartido por el `ConcurrentKafkaListenerContainerFactory`, la misma política aplica automáticamente a todos los consumers nuevos (`invoice-service`, `notification-service`, `analytics-service`, `audit-service`) sin configuración adicional.
+
+| Tipo de error | Ejemplo en el flujo completo | Estrategia |
+|----------------|-------------------------------|------------|
+| Transitorio | `invoice-service` no puede publicar en `invoices` por timeout de red. | Reintentar con backoff (3 intentos, 2 s). |
+| Permanente | Un evento en `payments` no cumple el contrato de `PaymentProcessedEvent`. | DLT directo, sin reintentar. |
+| Negocio | `invoice-service` recibe `payment-rejected`: no es un error, simplemente no genera factura. | No va a DLT; es un resultado válido del dominio. |
+| Técnico | Excepción no controlada en `notification-service` al enviar un correo. | Reintentar; si persiste, DLT. |
+
+Observabilidad: Kafka UI expone lag por Consumer Group (verificado en la Actividad 6 para `payment-service` e `inventory-service`); la misma vista debe monitorearse para los cuatro grupos nuevos. Un lag creciente en `notification-service` o `audit-service`, por ejemplo, indicaría procesamiento más lento que la tasa de publicación, sin bloquear a los demás servicios gracias a los Consumer Groups independientes.
+
+### 9. Consistencia eventual
+
+El pedido no tiene un estado único y sincronizado entre servicios: `order-service` lo crea como `CREATED`, pero `payment-service` e `inventory-service` lo evalúan en paralelo y de forma independiente (Cap. 5.4, evidenciado en la Actividad 6), por lo que durante una ventana breve el pedido puede aparecer como `CREATED` para un observador mientras ya existe un `payment-approved` publicado que aún no ha sido consumido por `notification-service`. Un estado agregado tipo `CONFIRMED` solo puede derivarse combinando los eventos `payment-approved` **e** `inventory-reserved` para el mismo `orderId` —es responsabilidad de un consumidor (p. ej. `analytics-service` o un futuro `order-status-service`) reconstruir ese estado a partir del historial de eventos, no de una actualización síncrona en `order-service`.
+
+### 10. Riesgos identificados
+
+- **Duplicados por reentrega**: ninguno de los consumers diseñados verifica `eventId` antes de actuar; un rebalanceo puede causar que `invoice-service` genere una factura duplicada. Mitigación: idempotencia vía `eventId` (Cap. 7.4), pendiente como mejora futura igual que en la Actividad 7.
+- **Replicación 1**: como se identificó en las Actividades 2 y 8, el entorno de laboratorio usa un solo broker; en producción se requiere factor de replicación 3 y `min.insync.replicas=2` en todos los topics, incluidos los nuevos (`invoices`, `notifications`, `audit`).
+- **Falta de `correlationId` propagado end-to-end**: si `order-service` no genera y propaga un `correlationId` desde el primer evento, `audit-service` no puede correlacionar automáticamente todos los eventos derivados de una misma operación.
+- **Acoplamiento por convención de nombres**: todos los servicios dependen de que los productores respeten el contrato de cada evento (campos y tipos); sin versionado (`eventVersion`, Cap. 8.3) un cambio de esquema en `payments` puede romper silenciosamente a `invoice-service` y `notification-service`.
+
+### 11. Verificación de restricciones (Cap. 10.3)
+
+| Restricción | Cómo se cumple |
+|-------------|------------------|
+| No usar un único topic general | 6 topics por dominio (`orders`, `payments`, `inventory`, `invoices`, `notifications`, `audit`), justificado desde la Actividad 5. |
+| Nombrar eventos como hechos ocurridos | Todos los eventos de la sección 4 están en pasado/participio (`-created`, `-approved`, `-rejected`, `-generated`, `-sent`, `-reserved`). |
+| Consumer Groups coherentes por servicio | Sección 5: un `groupId` por servicio lógico, sin grupos compartidos entre servicios distintos. |
+| Estrategia de errores y DLT | Sección 8, reutilizando `KafkaErrorHandlingConfig` implementado en la Actividad 7. |
+| Justificar la clave de particionamiento | Sección 6 (`orderId` vs. `correlationId`). |
+| Diferenciar procesos síncronos y asíncronos | Sección 7. |
+| Consideración sobre consistencia eventual | Sección 9. |
+
+### Conclusión
+
+La arquitectura propuesta escala el patrón ya validado en código (`orders` → `payment-service` / `inventory-service`, con Consumer Groups independientes y manejo de errores vía DLT) a los siete servicios exigidos por el reto final, manteniendo un topic por dominio, `orderId` como clave para preservar el orden por pedido, y `correlationId` para la trazabilidad transversal en auditoría. La consistencia entre servicios es eventual por diseño: no existe un único punto que conozca el estado global del pedido en todo momento, sino que dicho estado se reconstruye a partir del historial de eventos publicados, lo cual es aceptable porque ningún flujo de este dominio requiere consistencia fuerte inmediata entre `payment-service`, `inventory-service`, `invoice-service` y `notification-service`.
